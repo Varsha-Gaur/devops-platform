@@ -5,8 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
+    name: Lint and unit tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,3 +30,58 @@ jobs:
 
       - name: Unit tests
         run: pytest -v
+
+  security:
+    name: Security scans
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for secret scan)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dependency vulnerability scan (pip-audit)
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
+      - name: Secret detection (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Filesystem scan (Trivy)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" aquasec/trivy:latest \
+            fs --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 /src
+
+  docker:
+    name: Docker build, scan and smoke test
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t devops-platform:ci .
+
+      - name: Image scan (Trivy)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest \
+            image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 devops-platform:ci
+
+      - name: Smoke test container
+        run: |
+          docker run -d --name smoke -p 8000:8000 devops-platform:ci
+          for i in $(seq 1 15); do
+            curl -fs http://localhost:8000/health && break
+            sleep 2
+          done
+          curl -fs http://localhost:8000/health
+          docker logs smoke
